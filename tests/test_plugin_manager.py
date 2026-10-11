@@ -3,6 +3,7 @@ from io import StringIO
 import ipywidgets as ipw
 import pytest
 
+from aiida.manage.configuration import get_profile
 from aiidalab_qe.app.utils import plugin_manager
 from aiidalab_qe.app.utils.plugin_manager import (
     PluginManager,
@@ -10,6 +11,17 @@ from aiidalab_qe.app.utils.plugin_manager import (
     QeAppPluginData,
 )
 from aiidalab_qe.plugins import registry as plugin_registry
+from aiidalab_qe.plugins import state as plugin_state
+
+
+@pytest.fixture(autouse=True)
+def isolate_pending_plugin_restarts(monkeypatch, tmp_path):
+    monkeypatch.setattr(plugin_state, "_pending_restarts_dir", lambda: tmp_path)
+
+
+def _daemon_restart_command():
+    return ["verdi", "--profile", get_profile().name, "daemon", "restart"]
+
 
 # mock the content of the YAML file
 yaml_content = """
@@ -671,7 +683,7 @@ def test_update_package_clears_warning_after_minimum_is_met(monkeypatch):
             "test-plugin",
             "my-plugin",
         ],
-        ["verdi", "daemon", "restart"],
+        _daemon_restart_command(),
     ]
 
 
@@ -746,7 +758,7 @@ def test_update_package_resolves_version_above_upper_bound(monkeypatch):
             "test-plugin",
             "my-plugin",
         ],
-        ["verdi", "daemon", "restart"],
+        _daemon_restart_command(),
     ]
 
 
@@ -863,7 +875,7 @@ def test_retry_activation_clears_failure_and_restarts_daemon(monkeypatch):
             "test-plugin",
             "my-plugin",
         ],
-        ["verdi", "daemon", "restart"],
+        _daemon_restart_command(),
     ]
     assert plugin.registration_error is None
     assert plugin.retry_activation_button.layout.display == "none"
@@ -1041,7 +1053,7 @@ def test_remove_reconciles_all_plugin_controls(monkeypatch):
     assert plugin.remove_button.disabled
     assert plugin.version_warning.value == ""
     assert manager.accordion.get_title(0) == "My Test Plugin"
-    assert daemon_commands == [["verdi", "daemon", "restart"]]
+    assert daemon_commands == [_daemon_restart_command()]
 
 
 def test_install_reconciles_plugin_controls(monkeypatch):
@@ -1112,7 +1124,7 @@ def test_install_reconciles_plugin_controls(monkeypatch):
             "test-plugin",
             "my-plugin",
         ],
-        ["verdi", "daemon", "restart"],
+        _daemon_restart_command(),
     ]
 
 
@@ -1254,3 +1266,167 @@ def test_post_install_only_button_is_enabled_when_package_is_not_installed(
 
     post_install_button = manager.accordion.children[0].children[2].children[1]
     assert not post_install_button.disabled
+
+
+@pytest.mark.parametrize("action", ["_on_install", "_on_update"])
+def test_failed_restart_survives_reopening_and_setup_until_retry(monkeypatch, action):
+    installed = {"version": None if action == "_on_install" else "1.2.8"}
+    monkeypatch.setattr(
+        plugin_registry,
+        "get_plugin_version_info",
+        lambda *_args: (installed["version"], installed["version"] != "1.2.8", None),
+    )
+    monkeypatch.setattr(
+        plugin_registry, "poll_plugin_registration", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        plugin_registry, "poll_post_install", lambda *_args: (True, None)
+    )
+    monkeypatch.setattr(plugin_manager, "poll_daemon_status", lambda: None)
+
+    def install(*_args, **_kwargs):
+        installed["version"] = "1.2.9"
+        return True
+
+    monkeypatch.setattr(QeAppPlugin, "_execute_command", install)
+    commands = []
+    restart = {"succeeds": False}
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        failed = command[-2:] == ["daemon", "restart"] and not restart["succeeds"]
+        return plugin_manager.subprocess.CompletedProcess(
+            command, int(failed), "", "restart failed" if failed else ""
+        )
+
+    monkeypatch.setattr(plugin_manager.subprocess, "run", run)
+    _set_plugin_manager_registry(
+        monkeypatch,
+        {
+            "my-plugin": {
+                "title": "My Test Plugin",
+                "description": "A test plugin",
+                "pip": "my-plugin>=1.2.9",
+                "post_install": "setup",
+            }
+        },
+    )
+    manager = PluginManager()
+    manager._build_ui()
+    plugin = manager.accordion.children[0]
+    getattr(plugin, action)(None)
+    assert manager.accordion.get_title(0).endswith("⚠️")
+
+    fresh_manager = PluginManager()
+    fresh_manager._build_ui()
+    fresh_manager.refresh_plugins()  # The old daemon still reports running.
+    fresh_plugin = fresh_manager.accordion.children[0]
+    fresh_plugin._on_post_install(None)
+    assert fresh_plugin.restart_error
+    assert fresh_plugin.retry_activation_button.layout.display == ""
+    assert fresh_manager.accordion.get_title(0).endswith("⚠️")
+    assert plugin_registry.get_plugin_status(
+        "my-plugin", fresh_plugin.data
+    ).is_incompatible
+
+    restart["succeeds"] = True
+    commands.clear()
+    fresh_plugin._on_retry_activation(None)
+    assert commands == [_daemon_restart_command()]
+    assert not fresh_plugin.restart_error
+    assert fresh_plugin.retry_activation_button.layout.display == "none"
+    assert fresh_manager.accordion.get_title(0).endswith("✅")
+    assert not plugin_registry.get_plugin_status(
+        "my-plugin", fresh_plugin.data
+    ).is_incompatible
+
+
+def test_pending_restart_is_scoped_to_profile_and_plugin(monkeypatch):
+    from types import SimpleNamespace
+
+    profile = SimpleNamespace(uuid="first-profile")
+    monkeypatch.setattr(plugin_state, "get_profile", lambda: profile)
+    plugin_state.set_restart_pending("My_Plugin")
+    assert plugin_state.get_restart_failure("my-plugin")
+    assert not plugin_state.get_restart_failure("another-plugin")
+    plugin_state.set_restart_pending("another-plugin")
+    profile.uuid = "other-profile"
+    assert not plugin_state.get_restart_failure("my-plugin")
+    plugin_state.set_restart_pending("my-plugin")
+    profile.uuid = "first-profile"
+    assert plugin_state.get_restart_failure("my-plugin")
+    plugin_state.clear_restart_pending("my-plugin")
+    assert not plugin_state.get_restart_failure("my-plugin")
+    assert not plugin_state.get_restart_failure("another-plugin")
+    profile.uuid = "other-profile"
+    assert plugin_state.get_restart_failure("my-plugin")
+
+
+def test_restart_command_uses_active_profile(monkeypatch):
+    from types import SimpleNamespace
+
+    profile = SimpleNamespace(name="custom-profile", uuid="custom-profile-uuid")
+    monkeypatch.setattr(plugin_manager, "get_profile", lambda: profile)
+    monkeypatch.setattr(plugin_state, "get_profile", lambda: profile)
+    monkeypatch.setattr(
+        plugin_registry, "get_plugin_version_info", lambda *_args: (None, True, None)
+    )
+    data = QeAppPluginData.from_mapping(
+        "my-plugin", {"title": "My plugin", "description": "Test", "pip": "my-plugin"}
+    )
+    plugin = QeAppPlugin(data, plugin_name="my-plugin")
+    commands = []
+    monkeypatch.setattr(
+        plugin_manager.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command)
+            or plugin_manager.subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+    assert plugin._restart_daemon()
+    assert commands == [["verdi", "--profile", "custom-profile", "daemon", "restart"]]
+
+
+def test_runtime_post_install_verifier_uses_active_profile(monkeypatch):
+    from types import SimpleNamespace
+
+    from aiida.manage import configuration
+
+    monkeypatch.setattr(
+        configuration, "get_profile", lambda: SimpleNamespace(name="custom-profile")
+    )
+    commands = []
+    monkeypatch.setattr(
+        plugin_registry.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command)
+            or plugin_manager.subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+    assert plugin_registry.poll_post_install("my-plugin", "setup") == (True, None)
+    assert commands[0][-2:] == ["--profile", "custom-profile"]
+
+
+def test_runtime_post_install_verifier_preserves_explicit_profile(monkeypatch):
+    from types import SimpleNamespace
+
+    from aiida.manage import configuration
+
+    monkeypatch.setattr(
+        configuration, "get_profile", lambda: SimpleNamespace(name="custom-profile")
+    )
+    commands = []
+    monkeypatch.setattr(
+        plugin_registry.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command)
+            or plugin_manager.subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+    assert plugin_registry.poll_post_install(
+        "my-plugin", "setup", "explicit-profile"
+    ) == (True, None)
+    assert commands[0][-2:] == ["--profile", "explicit-profile"]

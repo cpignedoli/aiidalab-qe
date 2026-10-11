@@ -19,6 +19,7 @@ import traitlets as tl
 from IPython.display import display
 from packaging.requirements import Requirement
 
+from aiida.manage.configuration import get_profile
 from aiidalab_qe import __version__
 from aiidalab_qe.plugins.registry import (
     QeAppPluginData,
@@ -26,6 +27,7 @@ from aiidalab_qe.plugins.registry import (
     get_plugin_status,
     poll_daemon_status,
 )
+from aiidalab_qe.plugins.state import clear_restart_pending, set_restart_pending
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class QeAppPlugin(ipw.VBox):
     registration_error = tl.Unicode(default_value=None, allow_none=True)
     post_install_error = tl.Unicode(default_value=None, allow_none=True)
     daemon_error = tl.Unicode(default_value=None, allow_none=True)
+    restart_error = tl.Unicode(default_value=None, allow_none=True)
     version_warning_text = tl.Unicode(default_value="")
 
     def __init__(
@@ -190,6 +193,7 @@ class QeAppPlugin(ipw.VBox):
             self.app_compatible = status.app_compatible
             self.registration_error = status.registration_error
             self.post_install_error = status.post_install_error
+            self.restart_error = status.restart_error
 
     def update_title(self) -> None:
         if self.title_updater is None:
@@ -207,6 +211,7 @@ class QeAppPlugin(ipw.VBox):
         "registration_error",
         "post_install_error",
         "daemon_error",
+        "restart_error",
     )
     def _refresh_ui_state(self, _change: dict | None = None) -> None:
         """Update the UI state of the plugin."""
@@ -217,6 +222,12 @@ class QeAppPlugin(ipw.VBox):
     def _update_version_warning(self) -> None:
         """Build and store the warning text from the current plugin state."""
         warning = ""
+
+        if self.restart_error:
+            warning += (
+                '<div class="alert alert-danger" role="alert">'
+                f"{html.escape(self.restart_error)}</div>"
+            )
 
         if self.registration_error:
             warning += (
@@ -272,6 +283,7 @@ class QeAppPlugin(ipw.VBox):
                     and not self.registration_error
                     and not self.post_install_error
                     and not self.daemon_error
+                    and not self.restart_error
                 )
                 or not self.app_compatible
             )
@@ -286,6 +298,7 @@ class QeAppPlugin(ipw.VBox):
                     self.registration_error
                     or self.post_install_error
                     or self.daemon_error
+                    or self.restart_error
                 )
                 and self.is_installed
                 else "none"
@@ -500,7 +513,7 @@ class QeAppPlugin(ipw.VBox):
         self.message_container.value = ""
 
         if (
-            self.daemon_error
+            (self.daemon_error or self.restart_error)
             and not self.registration_error
             and not self.post_install_error
         ):
@@ -707,18 +720,22 @@ class QeAppPlugin(ipw.VBox):
             self.message_container.value or self.output_container.value
         )
 
-    @staticmethod
-    def _restart_daemon() -> bool:
+    def _restart_daemon(self) -> bool:
+        package_name = Requirement(self.data.pip or self.plugin_name).name
+        set_restart_pending(package_name)
+        command = ["verdi"]
+        if profile := get_profile():
+            command.extend(["--profile", profile.name])
+        command.extend(["daemon", "restart"])
         try:
-            result = subprocess.run(
-                ["verdi", "daemon", "restart"], capture_output=True, check=False
-            )
+            result = subprocess.run(command, capture_output=True, check=False)
         except OSError:
             LOGGER.exception("Could not restart the AiiDA daemon")
             return False
         if result.returncode:
             LOGGER.error("Could not restart the AiiDA daemon: %s", result.stderr)
             return False
+        clear_restart_pending(package_name)
         return True
 
 
